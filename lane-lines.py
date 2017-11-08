@@ -98,6 +98,30 @@ def weighted_img(img, initial_img, α=0.8, β=1., λ=0.):
     NOTE: initial_img and img must be the same shape!
     """
     return cv2.addWeighted(initial_img, α, img, β, λ)
+    
+def lane_line_edges(image):
+    """
+    """
+    gray = grayscale(image)
+    smooth = gaussian_blur(gray, 5)
+    return canny(smooth, 50, 150)
+
+def lane_line_hough_lines(edge_map, ROI):
+    """
+    """
+    mask = np.zeros_like(edge_map)
+    cv2.fillPoly(mask, ROI, 255)
+    masked_edges = cv2.bitwise_and(edge_map, mask)
+    
+    # detect line segments in edge map
+    return cv2.HoughLinesP(
+        masked_edges, 
+        rho = 2, 
+        theta = np.pi/180, 
+        threshold = 10, 
+        lines = np.array([]), 
+        minLineLength = 10, 
+        maxLineGap = 10)
 
 def line_seg_params(x1, y1, x2, y2):
     """
@@ -116,121 +140,153 @@ def line_seg_params(x1, y1, x2, y2):
         dir -= np.pi
     return x, y, dir, L
     
-def lane_lines(lines):
-    eps = math.sin(np.pi/12)
-    weights_L = []
-    weights_R = []
-    mids_L = [] 
-    mids_R = []
-    dirs_L = []
-    dirs_R = []
+def segments_to_lane_line(lines):
+    """
+    """
+    mids = [] 
+    dirs = []
+    weights = []
     
     for line in lines:
         for x1,y1,x2,y2 in line:
             x,y,dir,L = line_seg_params(x1,y1,x2,y2)
-            if math.fabs(dir) > np.pi/6 and math.fabs(dir) < np.pi/3:
-                if dir < 0.0:
-                    weights_L.append(L)
-                    mids_L.append((x,y))
-                    dirs_L.append(dir)
-                else:
-                    weights_R.append(L)
-                    mids_R.append((x,y))
-                    dirs_R.append(dir)
+            if math.fabs(dir) > np.pi/12 and math.fabs(dir) < 5*np.pi/12:
+                mids.append((x,y))
+                dirs.append(dir)
+                weights.append(L)
                     
-    xL = yL = dL = np.nan
-    xR = yR = dR = np.nan
+    x = y = u = v = np.nan
 
-    if len(weights_L) > 0:
-        xL, yL = np.average(mids_L, axis=0, weights=weights_L)
-        dL = np.average(dirs_L, axis=0, weights=weights_L)
+    if len(weights) > 0:
+        x, y = np.average(mids, axis=0, weights=weights)
+        dir = np.average(dirs, axis=0, weights=weights)
+        u, v = math.cos(dir), math.sin(dir)
 
-    if len(weights_R) > 0:
-        xR, yR = np.average(mids_R, axis=0, weights=weights_R)
-        dR = np.average(dirs_R, axis=0, weights=weights_R)
-        
-    return xL, yL, dL, xR, yR, dR
+    return x, y, u, v
+    
+def extract_lane_line(edge_map, ROI):
+    """
+    """
+    # detect line segments in edge map
+    hough_lines = lane_line_hough_lines(edge_map, ROI)
 
+    # filter/combine segments into single line
+    return segments_to_lane_line(hough_lines)
+    
+def draw_clipped_line(img, x, y, u, v, bot, top, color, thickness):
+    """
+    """
+    y1 = bot
+    t1 = (y1-y)/v
+    x1 = int(round(x + t1*u))
+    
+    y2 = top
+    t2 = (y2-y)/v
+    x2 = int(round(x + t2*u))
+    
+    cv2.line(img, (x1,y1), (x2,y2), color, thickness)
+    
+def bottom_of_ROI(image):
+    return image.shape[0] - 1
+
+def top_of_ROI(image):
+    return int(round(image.shape[0]*0.62))
+
+def left_lane_ROI(image):
+    """
+    """
+    bottom = bottom_of_ROI(image)
+    top = top_of_ROI(image)
+    imwidth = image.shape[1]
+    roi_TL = (int(round(imwidth*0.43)), top)
+    roi_BL = (int(round(imwidth*0.07)), bottom)
+    roi_BR = (int(round(imwidth*0.28)), bottom)
+    roi_TR = (int(round(imwidth*0.50)), top)
+    return np.array([[roi_TL, roi_BL, roi_BR, roi_TR]], dtype=np.int32)
+    
+def right_lane_ROI(image):
+    """
+    """
+    bottom = bottom_of_ROI(image)
+    top = top_of_ROI(image)
+    imwidth = image.shape[1]
+    roi_TL = (int(round(imwidth*0.50)), top)
+    roi_BL = (int(round(imwidth*0.79)), bottom)
+    roi_BR = (int(round(imwidth*1.00)), bottom)
+    roi_TR = (int(round(imwidth*0.59)), top)
+    return np.array([[roi_TL, roi_BL, roi_BR, roi_TR]], dtype=np.int32)
+    
 def process_image(image):
 
-    # define ROI
-    imwidth = image.shape[1]
-    imheight = image.shape[0]
+    # compute canny edge map
+    edge_map = lane_line_edges(image)
+    
+    # compute lane line ROI's
+    ROI_L = left_lane_ROI(image)
+    ROI_R = right_lane_ROI(image)
 
-    roi_B = round(imheight*0.62)
-    roi_T = imheight-1
-    
-    roi_BL = (round(imwidth*0.43), roi_B)
-    roi_TL = (round(imwidth*0.07), roi_T)
-    roi_TR = (round(imwidth*1.00), roi_T)
-    roi_BR = (round(imwidth*0.59), roi_B)
-
-    ROI_boundary = np.array([[roi_BL, roi_TL, roi_TR, roi_BR]], dtype=np.int32)
-    
-    ROI_hole = np.array(
-        [[
-            (round(imwidth*0.50), round(imheight*0.62)),
-            (round(imwidth*0.28), roi_T),
-            (round(imwidth*0.79), roi_T)
-        ]], 
-        dtype=np.int32)
-    
-    # compute masked canny edge map
-    gray = grayscale(image)
-    blur_gray = gaussian_blur(gray, 5)
-    edge_map = canny(blur_gray, 50, 150)
-    mask = np.zeros_like(edge_map)
-    cv2.fillPoly(mask, ROI_boundary, 255)
-    cv2.fillPoly(mask, ROI_hole, 0)
-    masked_edge_map = cv2.bitwise_and(edge_map, mask)
-    
-    # detect line segments in edge map
-    hough_lines = cv2.HoughLinesP(
-        masked_edge_map, 
-        rho = 2, 
-        theta = np.pi/180, 
-        threshold = 30, 
-        lines = np.array([]), 
-        minLineLength = 60, 
-        maxLineGap = 1000)
+    # extract left/right lane lines from edge data
+    xL, yL, uL, vL = extract_lane_line(edge_map, ROI_L)
+    xR, yR, uR, vR = extract_lane_line(edge_map, ROI_R)
         
-    # extract left/right lane lines from line segment data
-    xL, yL, dirL, xR, yR, dirR = lane_lines(hough_lines)
-    
     # draw lane lines overlay image
-    lines_img = np.zeros((image.shape[0], image.shape[1], 3), dtype=np.uint8)
+    lanes_img = np.zeros((image.shape[0], image.shape[1], 3), dtype=np.uint8)
     lane_color = [255,0,0]
     lane_thickness = 7
-    
-    # clip lane lines to top/bottom of ROI
-    y1 = roi_B
-    y2 = roi_T
+    clip_bottom = bottom_of_ROI(image)
+    clip_top = top_of_ROI(image)
     
     #draw left lane line
-    if not np.isnan(dirL):
-        uL = math.cos(dirL)
-        vL = math.sin(dirL)
-        x1 = int(round(xL + uL*((y1-yL)/vL)))
-        x2 = int(round(xL + uL*((y2-yL)/vL)))
-        cv2.line(lines_img, (x1,y1), (x2,y2), lane_color, lane_thickness)
+    if not np.isnan(xL):
+        draw_clipped_line(
+            lanes_img, 
+            xL, yL, uL, vL, 
+            clip_bottom, clip_top, 
+            lane_color, lane_thickness)
     
     #draw right lane line
-    if not np.isnan(dirR):
-        uR = math.cos(dirR)
-        vR = math.sin(dirR)
-        x1 = int(round(xR + uR*((y1-yR)/vR)))
-        x2 = int(round(xR + uR*((y2-yR)/vR)))
-        cv2.line(lines_img, (x1,y1), (x2,y2), lane_color, lane_thickness)
+    if not np.isnan(xR):
+        draw_clipped_line(
+            lanes_img, 
+            xR, yR, uR, vR, 
+            clip_bottom, clip_top, 
+            lane_color, lane_thickness)
     
-    # return original image overlayed with detected line segments
-    result = weighted_img(lines_img, image)
-    #cv2.polylines(result, ROI_boundary, isClosed=True, color=[0,0,255], thickness=1)
-    #cv2.polylines(result, ROI_hole, isClosed=True, color=[0,0,255], thickness=1)
+    # overlay lane lines onto original image
+    result = weighted_img(lanes_img, image)
+    # cv2.polylines(result, ROI_L, isClosed=True, color=[0,0,255], thickness=1)
+    # cv2.polylines(result, ROI_R, isClosed=True, color=[0,0,255], thickness=1)
     return result
     
-test_image_names = os.listdir("test_images/")
+in_dir = 'test_images/'
+out_dir = 'test_images_output/'
+
+if not os.path.exists(out_dir):
+    os.makedirs(out_dir)
+
+test_image_names = os.listdir(in_dir)
 
 for image_name in test_image_names:
-    image = mpimg.imread('test_images/' + image_name)
+
+    # full pipeline
+    image = mpimg.imread(in_dir + image_name)
     lanes = process_image(image)
-    plt.imsave('test_images_output/' + image_name, lanes)
+    plt.imsave(out_dir + image_name, lanes)
+
+    # diagnostic image: Canny edges
+    edge_map = lane_line_edges(image)
+    left_ROI = left_lane_ROI(image)
+    right_ROI = right_lane_ROI(image)
+    mask = np.zeros_like(edge_map)
+    cv2.fillPoly(mask, left_ROI, 255)
+    cv2.fillPoly(mask, right_ROI, 255)
+    masked_edges = cv2.bitwise_and(edge_map, mask)
+    plt.imsave(out_dir + 'edges-' + image_name, masked_edges, cmap='gray')
+
+    # diagnostic image: Hough lines
+    hough_img = np.zeros((image.shape[0], image.shape[1], 3), dtype=np.uint8)
+    hough_L = lane_line_hough_lines(edge_map, left_lane_ROI(image))
+    hough_R = lane_line_hough_lines(edge_map, right_lane_ROI(image))
+    draw_lines(hough_img, hough_L)
+    draw_lines(hough_img, hough_R)
+    plt.imsave(out_dir + 'lines-' + image_name, hough_img)
